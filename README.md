@@ -2,7 +2,7 @@
 
 > **Full-stack observability platform** implementing the three pillars of observability — Metrics, Logs, and Traces — for containerized applications using production-grade open-source tools.
 
-[![CI Status](https://github.com/YOUR_USERNAME/observability-stack/actions/workflows/observability-ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/observability-stack/actions)
+[![CI Status](https://github.com/suyashdworkspace/observability-stack/actions/workflows/observability-ci.yml/badge.svg)](https://github.com/suyashdworkspace/observability-stack/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://docs.docker.com/compose/)
 [![Prometheus](https://img.shields.io/badge/Prometheus-v2.51-E6522C?logo=prometheus)](https://prometheus.io/)
@@ -66,7 +66,7 @@
 
 ### 1. Clone and configure
 ```bash
-git clone https://github.com/YOUR_USERNAME/observability-stack.git
+git clone https://github.com/suyashdworkspace/observability-stack.git
 cd observability-stack
 cp .env.example .env
 # Edit .env to set your Grafana admin password
