@@ -1,0 +1,105 @@
+groups:
+  - name: application_alerts
+    interval: 30s
+    rules:
+      # Alert: Service Down
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Service {{ $labels.job }} is DOWN"
+          description: "Target {{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute."
+          runbook_url: "https://wiki.example.com/runbooks/service-down"
+
+      # Alert: High HTTP Error Rate
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum by (job) (rate(http_requests_total[5m]))
+          ) * 100 > 5
+        for: 2m
+        labels:
+          severity: warning
+          team: application
+        annotations:
+          summary: "High HTTP error rate on {{ $labels.job }}"
+          description: "Error rate is {{ $value | humanize }}% (threshold: 5%) over the last 5 minutes."
+
+      # Alert: High P99 Latency
+      - alert: HighLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))) > 2.0
+        for: 3m
+        labels:
+          severity: warning
+          team: application
+        annotations:
+          summary: "High P99 latency on {{ $labels.job }}"
+          description: "P99 request latency is {{ $value | humanizeDuration }} (threshold: 2s)."
+
+      # Alert: High Business Error Rate
+      - alert: HighBusinessErrorRate
+        expr: rate(business_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: application
+        annotations:
+          summary: "High business error rate: {{ $labels.error_type }}"
+          description: "Business error type '{{ $labels.error_type }}' rate is {{ $value | humanize }}/s."
+
+  - name: infrastructure_alerts
+    interval: 60s
+    rules:
+      # Alert: High CPU Usage
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | humanize }}% (threshold: 85%)."
+
+      # Alert: High Memory Usage
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanize }}% (threshold: 85%)."
+
+      # Alert: Disk Space Low
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"} / node_filesystem_size_bytes) * 100 < 15
+        for: 10m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}:{{ $labels.mountpoint }}"
+          description: "Disk space is {{ $value | humanize }}% free (threshold: 15%)."
+
+      # Alert: Container Restarting
+      - alert: ContainerRestarting
+        expr: |
+          increase(container_restart_count_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Container {{ $labels.name }} is restarting frequently"
+          description: "Container {{ $labels.name }} has restarted {{ $value }} times in the last 15 minutes."

@@ -1,0 +1,285 @@
+name: Observability Stack CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily at 2 AM UTC to catch dependency drift
+    - cron: '0 2 * * *'
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOCKER_COMPOSE_VERSION: "2.24.0"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 1: Lint and validate configuration files
+  # ─────────────────────────────────────────────────────────────────────
+  lint-and-validate:
+    name: Lint & Validate Configs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install Python linting tools
+        run: |
+          pip install flake8 black isort mypy types-requests
+
+      - name: Lint Python files with flake8
+        run: |
+          flake8 app/ scripts/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=app/venv/,scripts/venv/
+
+      - name: Check Python formatting with black
+        run: |
+          black --check --line-length=120 app/main.py scripts/alertmanager_sns.py
+
+      - name: Check import ordering with isort
+        run: |
+          isort --check-only --diff app/main.py scripts/alertmanager_sns.py
+
+      - name: Validate Prometheus configuration
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/prometheus:/prometheus-config \
+            prom/prometheus:v2.51.0 \
+            promtool check config /prometheus-config/prometheus.yml
+          echo "Prometheus config is valid."
+
+      - name: Validate Prometheus alert rules
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/prometheus:/prometheus-config \
+            prom/prometheus:v2.51.0 \
+            promtool check rules /prometheus-config/rules/alert_rules.yml
+          echo "Alert rules are valid."
+
+      - name: Validate Alertmanager configuration
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/alertmanager:/alertmanager-config \
+            prom/alertmanager:v0.27.0 \
+            amtool check-config /alertmanager-config/alertmanager.yml
+          echo "Alertmanager config is valid."
+
+      - name: Validate Docker Compose file
+        run: |
+          docker compose config > /dev/null
+          echo "Docker Compose config is valid."
+
+      - name: Validate YAML files syntax
+        run: |
+          pip install yamllint
+          yamllint -d relaxed \
+            prometheus/prometheus.yml \
+            prometheus/rules/alert_rules.yml \
+            alertmanager/alertmanager.yml \
+            loki/loki-config.yml \
+            promtail/promtail-config.yml \
+            otel-collector/otel-collector-config.yml \
+            grafana/provisioning/datasources/datasources.yml \
+            grafana/provisioning/dashboards/dashboards.yml
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 2: Build Docker image
+  # ─────────────────────────────────────────────────────────────────────
+  build-docker-image:
+    name: Build Application Docker Image
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build FastAPI application image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          dockerfile: ./app/Dockerfile
+          push: false
+          tags: observability-app:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Scan image for vulnerabilities with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'observability-app:ci-${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'   # Don't fail on vulnerabilities in CI (report only)
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 3: Integration tests (smoke test the stack)
+  # ─────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build-docker-image
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python for test scripts
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: pip install requests pytest
+
+      - name: Create .env file for CI
+        run: |
+          cat > .env << 'EOF'
+          GF_SECURITY_ADMIN_USER=admin
+          GF_SECURITY_ADMIN_PASSWORD=testpassword123
+          APP_ENV=ci
+          EOF
+
+      - name: Start the observability stack
+        run: |
+          docker compose up -d --build
+          echo "Waiting for services to initialize..."
+          sleep 45
+
+      - name: Check all containers are running
+        run: |
+          RUNNING=$(docker compose ps --status running --format json | python3 -c "import json,sys; data=json.load(sys.stdin); print(len(data))")
+          echo "Running containers: $RUNNING"
+          if [ "$RUNNING" -lt 9 ]; then
+            echo "ERROR: Expected 9 containers, got $RUNNING"
+            docker compose ps
+            docker compose logs --tail=50
+            exit 1
+          fi
+
+      - name: Smoke test - Prometheus health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9090/-/healthy)
+          [ "$STATUS" = "200" ] || (echo "Prometheus health check failed: HTTP $STATUS" && exit 1)
+          echo "Prometheus: OK"
+
+      - name: Smoke test - Grafana health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u admin:testpassword123 http://localhost:3000/api/health)
+          [ "$STATUS" = "200" ] || (echo "Grafana health check failed: HTTP $STATUS" && exit 1)
+          echo "Grafana: OK"
+
+      - name: Smoke test - Loki readiness
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3100/ready)
+          [ "$STATUS" = "200" ] || (echo "Loki readiness check failed: HTTP $STATUS" && exit 1)
+          echo "Loki: OK"
+
+      - name: Smoke test - Application health
+        run: |
+          RESPONSE=$(curl -s http://localhost:8000/health)
+          echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['status']=='healthy', f'Unexpected: {d}'"
+          echo "Application: OK"
+
+      - name: Smoke test - Prometheus targets
+        run: |
+          sleep 30
+          python3 - << 'EOF'
+          import requests, sys
+          r = requests.get("http://localhost:9090/api/v1/targets")
+          targets = r.json()["data"]["activeTargets"]
+          down = [t for t in targets if t["health"] != "up"]
+          if down:
+              print(f"DOWN targets: {[t['labels'] for t in down]}")
+              sys.exit(1)
+          print(f"All {len(targets)} targets are UP")
+          EOF
+
+      - name: Smoke test - FastAPI metrics endpoint
+        run: |
+          METRICS=$(curl -s http://localhost:8000/metrics)
+          echo "$METRICS" | grep -q "http_requests_total" || (echo "Expected metric not found" && exit 1)
+          echo "Application metrics: OK"
+
+      - name: Smoke test - Jaeger service list
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:16686/api/services)
+          [ "$STATUS" = "200" ] || (echo "Jaeger API check failed: HTTP $STATUS" && exit 1)
+          echo "Jaeger: OK"
+
+      - name: Run load test
+        run: |
+          # Install hey
+          wget -q https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64 -O /usr/local/bin/hey
+          chmod +x /usr/local/bin/hey
+          hey -n 200 -c 20 -q 50 http://localhost:8000/api/items
+          echo "Load test completed."
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          docker compose logs --tail=100 > /tmp/compose-logs.txt
+          cat /tmp/compose-logs.txt
+
+      - name: Upload logs artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs-${{ github.run_id }}
+          path: /tmp/compose-logs.txt
+          retention-days: 7
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 4: Security scanning
+  # ─────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan for secrets with TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --only-verified
+
+      - name: Run Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/docker
+            p/secrets

@@ -1,0 +1,94 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchsize: 1048576   # 1MB
+    batchwait: 1s
+    timeout: 10s
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+  # ─── Docker container logs via Docker socket ────────────────────────────────
+  - job_name: docker-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: status
+            values: ["running"]
+
+    relabel_configs:
+      # Use container name as job label
+      - source_labels: [__meta_docker_container_name]
+        regex: '/(.*)'
+        target_label: container
+      # Use compose service name as service label
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      # Use compose project name
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        target_label: compose_project
+      # Filter to only our project containers
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        regex: 'observability-stack'
+        action: keep
+
+    pipeline_stages:
+      # Parse JSON log lines from FastAPI app
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            message: message
+            service: service
+            trace_id: trace_id
+            span_id: span_id
+            status_code: status_code
+            duration_ms: duration_ms
+            method: method
+            path: path
+
+      # Set the log level label from parsed JSON
+      - labels:
+          level:
+          service:
+          trace_id:
+
+      # Set timestamp from the log line itself (not Docker timestamp)
+      - timestamp:
+          source: timestamp
+          format: "2006-01-02T15:04:05.999999999"
+          fallback_formats:
+            - "2006-01-02T15:04:05"
+          location: UTC
+
+      # Drop DEBUG logs to save storage
+      - drop:
+          expression: '.*"level":"DEBUG".*'
+          drop_counter_reason: debug_log_dropped
+
+  # ─── Static file log shipping (for host system logs) ──────────────────────
+  - job_name: system-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: syslog
+          host: docker-host
+          __path__: /var/log/syslog
+
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\w+\s+\d+\s+\d+:\d+:\d+)\s+(?P<hostname>\S+)\s+(?P<program>[^:]+):\s+(?P<message>.*)$'
+      - labels:
+          hostname:
+          program:

@@ -1,0 +1,62 @@
+global:
+  resolve_timeout: 5m
+  smtp_require_tls: true
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  receiver: 'default-receiver'
+
+  routes:
+    # Critical alerts go to PagerDuty (simulated via webhook)
+    - match:
+        severity: critical
+      receiver: 'critical-webhook'
+      continue: true
+
+    # Application team alerts
+    - match:
+        team: application
+      receiver: 'app-team-webhook'
+
+    # Infrastructure alerts
+    - match:
+        team: infrastructure
+      receiver: 'infra-team-webhook'
+
+receivers:
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5001/webhook/default'
+        send_resolved: true
+        http_config:
+          timeout: 10s
+
+  - name: 'critical-webhook'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5001/webhook/critical'
+        send_resolved: true
+        max_alerts: 10
+
+  - name: 'app-team-webhook'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5001/webhook/app-team'
+        send_resolved: true
+
+  - name: 'infra-team-webhook'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5001/webhook/infra-team'
+        send_resolved: true
+
+inhibit_rules:
+  # Inhibit warning alerts if a critical alert is already firing for the same job
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'job', 'instance']
